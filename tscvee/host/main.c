@@ -44,6 +44,7 @@
 
 #include <stdint.h>
 #include "tsc_privkey.h"
+#include <sodium.h>
 // 分段传输数据到 TA
 static TEEC_Result transfer_data_to_ta(TEEC_Session *sess, 
                                       const char *data, 
@@ -88,19 +89,52 @@ static TEEC_Result transfer_data_to_ta(TEEC_Session *sess,
         return TEEC_SUCCESS;
 }
 
-// Minimal XOR transform: dst = src XOR key (key repeats). If keylen==0 dst==src (no-op).
-static void xor_transform(uint8_t *dst, const uint8_t *src, size_t len,
-                                                  const uint8_t *key, size_t keylen)
+// Encrypt plaintext (bytecode string) using libsodium AES-256-GCM.
+// Produces an output buffer layout: [12-byte nonce][ciphertext+tag].
+// Returns 0 on success, -1 on failure. On success *out_buf is malloc'd
+// and must be freed by caller; *out_len gets encrypted total length.
+static int libsodium_aes_gcm_encrypt(const unsigned char *plaintext, size_t plaintext_len,
+                                     const unsigned char *key32, unsigned char **out_buf, size_t *out_len)
 {
-        if (!dst || !src) return;
-        if (keylen == 0) {
-                memcpy(dst, src, len);
-                return;
-        }
+    const size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES; /* 12 */
+    unsigned char nonce[crypto_aead_aes256gcm_NPUBBYTES];
+    randombytes_buf(nonce, nonce_len);
 
-        for (size_t i = 0; i < len; ++i) {
-                dst[i] = src[i] ^ key[i % keylen];
+    unsigned long long clen = 0;
+    size_t ciphertext_len = plaintext_len + crypto_aead_aes256gcm_ABYTES; /* tag appended */
+
+    unsigned char *ciphertext = malloc(ciphertext_len);
+    if (!ciphertext) return -1;
+
+    if (crypto_aead_aes256gcm_is_available()) {
+        if (crypto_aead_aes256gcm_encrypt(ciphertext, &clen,
+                                          plaintext, (unsigned long long)plaintext_len,
+                                          NULL, 0, /* additional data */
+                                          NULL,
+                                          nonce, key32) != 0) {
+            free(ciphertext);
+            return -1;
         }
+    } else {
+        /* AES-GCM not available in this build of libsodium */
+        free(ciphertext);
+        return -1;
+    }
+
+    size_t total = nonce_len + (size_t)clen;
+    unsigned char *buf = malloc(total);
+    if (!buf) {
+        free(ciphertext);
+        return -1;
+    }
+    memcpy(buf, nonce, nonce_len);
+    memcpy(buf + nonce_len, ciphertext, (size_t)clen);
+
+    free(ciphertext);
+
+    *out_buf = (unsigned char *)buf;
+    *out_len = total;
+    return 0;
 }
 
 // Load private key: prefer environment variable TSC_PRIVKEY, else fallback to
@@ -253,36 +287,40 @@ int main(int argc, char *argv[])
                 printf("Gas: %d\n", cjson_gas->valueint);
 
                 /*
-                 * Encrypt bytecode with a minimal symmetric XOR using a private key.
-                 * The TA is expected to have the same key compiled/provisioned and
-                 * will perform the reverse transform when receiving chunks.
-                 *
-                 * Assumptions: the key is available via the environment variable
-                 * TSC_PRIVKEY or falls back to the compile-time TSC_PRIVKEY in
-                 * tsc_privkey.h. This is a minimal demo; replace with a real
-                 * crypto library (AES/GCM, libsodium, etc.) for production use.
-                 */
-                size_t bc_len = strlen(cjson_bytecode->valuestring);
-                char *encrypted_bytecode = NULL;
-                const char *privkey = NULL;
-                size_t privkey_len = 0;
+         * Encrypt bytecode with libsodium AES-256-GCM.
+         * Host derives a 32-byte key from the passphrase and encrypts the
+         * entire bytecode string. The TA must have the same passphrase/key
+         * and will decrypt before parsing.
+         */
+        size_t plaintext_len = strlen(cjson_bytecode->valuestring);
+        unsigned char *encrypted_buf = NULL;
+        size_t encrypted_len = 0;
+        const char *privkey = NULL;
+        size_t privkey_len = 0;
 
-                privkey = get_privkey(&privkey_len);
-                encrypted_bytecode = malloc(bc_len + 1);
-                if (!encrypted_bytecode) {
-                        printf("Failed to allocate encrypted buffer\n");
-                        cJSON_Delete(cjson_content);
-                        free(p);
-                        return -1;
-                }
+        if (sodium_init() < 0) {
+            printf("libsodium initialization failed\n");
+            cJSON_Delete(cjson_content);
+            free(p);
+            return -1;
+        }
 
-                xor_transform((uint8_t *)encrypted_bytecode,
-                                          (const uint8_t *)cjson_bytecode->valuestring,
-                                          bc_len,
-                                          (const uint8_t *)privkey,
-                                          privkey_len);
-                encrypted_bytecode[bc_len] = '\0';
+        privkey = get_privkey(&privkey_len);
+        unsigned char key32[32];
+        /* Derive a 32-byte key from passphrase using generic hash (simple KDF). */
+        crypto_generichash(key32, sizeof(key32), (const unsigned char*)privkey,
+                           (unsigned long long)privkey_len, NULL, 0);
 
+        if (libsodium_aes_gcm_encrypt((const unsigned char*)cjson_bytecode->valuestring,
+                                      plaintext_len, key32, &encrypted_buf, &encrypted_len) != 0) {
+            printf("Encryption failed (AES-GCM not available or error)\n");
+            cJSON_Delete(cjson_content);
+            free(p);
+            return -1;
+        }
+
+        /* We'll send encrypted_buf of length encrypted_len */
+*** End Patch
         /* Initialize a context connecting us to the TEE */
         res = TEEC_InitializeContext(NULL, &ctx);
         if (res != TEEC_SUCCESS)
@@ -305,7 +343,7 @@ int main(int argc, char *argv[])
                                          TEEC_VALUE_INPUT,
                                          TEEC_VALUE_INPUT,
                                          TEEC_NONE);
-        op.params[0].value.a = (int)bc_len;
+        op.params[0].value.a = (int)encrypted_len;
         op.params[1].value.a = strlen(cjson_input->valuestring);
         op.params[2].value.a = cjson_gas->valueint;
 
@@ -322,14 +360,14 @@ int main(int argc, char *argv[])
         /*
          * Transfer bytecode in chunks
          */
-        printf("Transferring bytecode (%zu bytes)...\n", bc_len);
-        res = transfer_data_to_ta(&sess, encrypted_bytecode, 
-                                 bc_len,
+        printf("Transferring encrypted bytecode (%zu bytes)...\n", encrypted_len);
+        res = transfer_data_to_ta(&sess, (const char *)encrypted_buf, 
+                                 encrypted_len,
                                  TA_TSC_VEE_CMD_TRANSFER_DATA, 1);
         if (res != TEEC_SUCCESS)
                 errx(1, "Failed to transfer bytecode: 0x%x", res);
 
-        free(encrypted_bytecode);
+        free(encrypted_buf);
 
         /*
          * Transfer input in chunks

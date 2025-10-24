@@ -28,6 +28,7 @@
 #include <tee_internal_api.h>
 #include <tee_internal_api_extensions.h>
 #include <string.h>
+#include <sodium.h>
 
 #include <stdint.h>
 #include "tsc_privkey.h"
@@ -56,6 +57,11 @@ static size_t output_size = 0;
 TEE_Result TA_CreateEntryPoint(void)
 {
 	DMSG("TSC-VEE TA created");
+	/* initialize libsodium in TA (if libsodium is linked into the TA) */
+	if (sodium_init() < 0) {
+		IMSG("libsodium init failed in TA");
+		return TEE_ERROR_GENERIC;
+	}
 	return TEE_SUCCESS;
 }
 
@@ -233,25 +239,18 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 		IMSG("Initialized transfer: bytecode_size=%zu, input_size=%zu, gas=%u",
 		     bytecode_size, input_size, gas_limit);
 	} else if (data_type == 1) {
-		// 传输bytecode（接收后解密）
+		// 传输bytecode（接收为加密数据）
 		if (!bytecode_buffer) {
 			return TEE_ERROR_BAD_STATE;
 		}
 		if (offset + chunk_size > bytecode_size) {
 			return TEE_ERROR_BAD_PARAMETERS;
 		}
-		/* Decrypt chunk_data using the same XOR key used on host. */
-		const char *ta_key = TSC_PRIVKEY;
-		size_t ta_key_len = strlen(ta_key);
-		if (ta_key_len == 0) {
-			/* No key configured, copy as-is */
-			memcpy(bytecode_buffer + offset, chunk_data, chunk_size);
-		} else {
-			for (size_t i = 0; i < chunk_size; ++i) {
-				bytecode_buffer[offset + i] = ((char *)chunk_data)[i] ^ ta_key[i % ta_key_len];
-			}
-		}
-		IMSG("Received (and decrypted) bytecode chunk: offset=%zu, size=%zu", offset, chunk_size);
+		/* Copy encrypted chunk into the bytecode_buffer. Decryption will be
+		 * performed once the full blob is received (in execute_with_data).
+		 */
+		memcpy(bytecode_buffer + offset, chunk_data, chunk_size);
+		IMSG("Received encrypted bytecode chunk: offset=%zu, size=%zu", offset, chunk_size);
 	} else if (data_type == 2) {
 		// 传输input
 		if (!input_buffer) {
@@ -308,7 +307,50 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	// 3. 设置EVM版本
 	enum evmc_revision rev = EVMC_LONDON;
 
-	// 4. 转换十六进制字符串为字节数组 - 严格按照REE的逻辑
+	// 4. 如果接收到的是加密的 bytecode（格式：[nonce][ciphertext+tag]），先解密，然后转换十六进制字符串为字节数组 - 严格按照REE的逻辑
+	if (bytecode_buffer && bytecode_size > 0) {
+		/* Expect at least nonce + tag */
+		size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES;
+		size_t tag_len = crypto_aead_aes256gcm_ABYTES;
+		if (bytecode_size >= nonce_len + tag_len) {
+			unsigned char *enc = (unsigned char *)bytecode_buffer;
+			unsigned char *nonce = enc; /* first nonce_len bytes */
+			unsigned char *cipher = enc + nonce_len;
+			size_t cipher_len = bytecode_size - nonce_len;
+
+			/* derive 32-byte key from passphrase */
+			unsigned char key32[32];
+			const char *ta_priv = TSC_PRIVKEY;
+			size_t ta_priv_len = strlen(ta_priv);
+			crypto_generichash(key32, sizeof(key32), (const unsigned char*)ta_priv,
+			                   (unsigned long long)ta_priv_len, NULL, 0);
+
+			unsigned long long mlen = 0;
+			size_t max_mlen = cipher_len; /* upper bound */
+			unsigned char *plaintext = (unsigned char *)TEE_Malloc(max_mlen + 1, 0);
+			if (!plaintext) {
+				IMSG("ERROR: Failed to allocate plaintext buffer for decryption");
+				return TEE_ERROR_OUT_OF_MEMORY;
+			}
+
+			if (crypto_aead_aes256gcm_decrypt(plaintext, &mlen, NULL,
+							cipher, (unsigned long long)cipher_len,
+							NULL, 0,
+							nonce, key32) != 0) {
+				IMSG("Decryption of bytecode failed");
+				TEE_Free(plaintext);
+				return TEE_ERROR_SECURITY;
+			}
+
+			/* Null-terminate and replace bytecode_buffer */
+			plaintext[mlen] = '\0';
+			TEE_Free(bytecode_buffer);
+			bytecode_buffer = (char *)plaintext;
+			bytecode_size = (size_t)mlen;
+			IMSG("Decrypted bytecode, plaintext size=%zu", bytecode_size);
+		}
+	}
+
 	size_t code_size = bytecode_size / 2 - 1;  // 去掉0x前缀
 	byte *code = (byte *)TEE_Malloc(sizeof(byte) * code_size, 0);
 	if (!code) {
