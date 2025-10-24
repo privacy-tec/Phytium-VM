@@ -42,6 +42,8 @@
 /* Maximum chunk size for data transfer */
 #define MAX_CHUNK_SIZE 8192
 
+#include <stdint.h>
+#include "tsc_privkey.h"
 // 分段传输数据到 TA
 static TEEC_Result transfer_data_to_ta(TEEC_Session *sess, 
                                       const char *data, 
@@ -86,6 +88,33 @@ static TEEC_Result transfer_data_to_ta(TEEC_Session *sess,
         return TEEC_SUCCESS;
 }
 
+// Minimal XOR transform: dst = src XOR key (key repeats). If keylen==0 dst==src (no-op).
+static void xor_transform(uint8_t *dst, const uint8_t *src, size_t len,
+                                                  const uint8_t *key, size_t keylen)
+{
+        if (!dst || !src) return;
+        if (keylen == 0) {
+                memcpy(dst, src, len);
+                return;
+        }
+
+        for (size_t i = 0; i < len; ++i) {
+                dst[i] = src[i] ^ key[i % keylen];
+        }
+}
+
+// Load private key: prefer environment variable TSC_PRIVKEY, else fallback to
+// compile-time TSC_PRIVKEY from tsc_privkey.h. Returns pointer and length.
+static const char *get_privkey(size_t *out_len)
+{
+        const char *k = getenv("TSC_PRIVKEY");
+        if (k && k[0] != '\0') {
+                if (out_len) *out_len = strlen(k);
+                return k;
+        }
+        if (out_len) *out_len = strlen(TSC_PRIVKEY);
+        return TSC_PRIVKEY;
+}
 // 从 TA 分段接收输出数据
 static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data)
 {
@@ -219,9 +248,40 @@ int main(int argc, char *argv[])
         cjson_input = cJSON_GetObjectItem(cjson_content, "input");
         cjson_gas = cJSON_GetObjectItem(cjson_content, "gas");
         
-        printf("Bytecode: %s\n", cjson_bytecode->valuestring);
-        printf("Input: %s\n", cjson_input->valuestring);
-        printf("Gas: %d\n", cjson_gas->valueint);
+                printf("Bytecode: %s\n", cjson_bytecode->valuestring);
+                printf("Input: %s\n", cjson_input->valuestring);
+                printf("Gas: %d\n", cjson_gas->valueint);
+
+                /*
+                 * Encrypt bytecode with a minimal symmetric XOR using a private key.
+                 * The TA is expected to have the same key compiled/provisioned and
+                 * will perform the reverse transform when receiving chunks.
+                 *
+                 * Assumptions: the key is available via the environment variable
+                 * TSC_PRIVKEY or falls back to the compile-time TSC_PRIVKEY in
+                 * tsc_privkey.h. This is a minimal demo; replace with a real
+                 * crypto library (AES/GCM, libsodium, etc.) for production use.
+                 */
+                size_t bc_len = strlen(cjson_bytecode->valuestring);
+                char *encrypted_bytecode = NULL;
+                const char *privkey = NULL;
+                size_t privkey_len = 0;
+
+                privkey = get_privkey(&privkey_len);
+                encrypted_bytecode = malloc(bc_len + 1);
+                if (!encrypted_bytecode) {
+                        printf("Failed to allocate encrypted buffer\n");
+                        cJSON_Delete(cjson_content);
+                        free(p);
+                        return -1;
+                }
+
+                xor_transform((uint8_t *)encrypted_bytecode,
+                                          (const uint8_t *)cjson_bytecode->valuestring,
+                                          bc_len,
+                                          (const uint8_t *)privkey,
+                                          privkey_len);
+                encrypted_bytecode[bc_len] = '\0';
 
         /* Initialize a context connecting us to the TEE */
         res = TEEC_InitializeContext(NULL, &ctx);
@@ -245,7 +305,7 @@ int main(int argc, char *argv[])
                                          TEEC_VALUE_INPUT,
                                          TEEC_VALUE_INPUT,
                                          TEEC_NONE);
-        op.params[0].value.a = strlen(cjson_bytecode->valuestring);
+        op.params[0].value.a = (int)bc_len;
         op.params[1].value.a = strlen(cjson_input->valuestring);
         op.params[2].value.a = cjson_gas->valueint;
 
@@ -262,12 +322,14 @@ int main(int argc, char *argv[])
         /*
          * Transfer bytecode in chunks
          */
-        printf("Transferring bytecode (%zu bytes)...\n", strlen(cjson_bytecode->valuestring));
-        res = transfer_data_to_ta(&sess, cjson_bytecode->valuestring, 
-                                 strlen(cjson_bytecode->valuestring),
+        printf("Transferring bytecode (%zu bytes)...\n", bc_len);
+        res = transfer_data_to_ta(&sess, encrypted_bytecode, 
+                                 bc_len,
                                  TA_TSC_VEE_CMD_TRANSFER_DATA, 1);
         if (res != TEEC_SUCCESS)
                 errx(1, "Failed to transfer bytecode: 0x%x", res);
+
+        free(encrypted_bytecode);
 
         /*
          * Transfer input in chunks

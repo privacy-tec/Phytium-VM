@@ -29,6 +29,9 @@
 #include <tee_internal_api_extensions.h>
 #include <string.h>
 
+#include <stdint.h>
+#include "tsc_privkey.h"
+
 #include <tsc_vee_ta.h>
 
 // 包含EVM相关头文件
@@ -230,15 +233,25 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 		IMSG("Initialized transfer: bytecode_size=%zu, input_size=%zu, gas=%u",
 		     bytecode_size, input_size, gas_limit);
 	} else if (data_type == 1) {
-		// 传输bytecode
+		// 传输bytecode（接收后解密）
 		if (!bytecode_buffer) {
 			return TEE_ERROR_BAD_STATE;
 		}
 		if (offset + chunk_size > bytecode_size) {
 			return TEE_ERROR_BAD_PARAMETERS;
 		}
-		memcpy(bytecode_buffer + offset, chunk_data, chunk_size);
-		IMSG("Received bytecode chunk: offset=%zu, size=%zu", offset, chunk_size);
+		/* Decrypt chunk_data using the same XOR key used on host. */
+		const char *ta_key = TSC_PRIVKEY;
+		size_t ta_key_len = strlen(ta_key);
+		if (ta_key_len == 0) {
+			/* No key configured, copy as-is */
+			memcpy(bytecode_buffer + offset, chunk_data, chunk_size);
+		} else {
+			for (size_t i = 0; i < chunk_size; ++i) {
+				bytecode_buffer[offset + i] = ((char *)chunk_data)[i] ^ ta_key[i % ta_key_len];
+			}
+		}
+		IMSG("Received (and decrypted) bytecode chunk: offset=%zu, size=%zu", offset, chunk_size);
 	} else if (data_type == 2) {
 		// 传输input
 		if (!input_buffer) {
