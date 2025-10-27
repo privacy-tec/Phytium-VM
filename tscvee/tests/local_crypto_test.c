@@ -118,6 +118,113 @@ static int decrypt_complete_blob(const unsigned char *encrypted, size_t encrypte
     return 0;
 }
 
+/* Test the encryption/decryption of TA output */
+static void test_output_encryption(void)
+{
+    printf("\n=== Testing output encryption/decryption ===\n");
+    const char *test_output = "\nResult: 0\nGas used: 21000\nOutput: 0xabcdef\n";
+    size_t output_len = strlen(test_output);
+    printf("Original output text (%zu bytes):\n%s\n", output_len, test_output);
+
+    /* Derive encryption key */
+    unsigned char key32[32];
+    const char *privkey = TSC_PRIVKEY;
+    size_t privkey_len = strlen(privkey);
+    crypto_generichash(key32, sizeof(key32),
+                       (const unsigned char*)privkey,
+                       (unsigned long long)privkey_len,
+                       NULL, 0);
+
+    /* Encrypt output (simulating TA's encryption) */
+    const size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES;
+    unsigned char nonce[crypto_aead_aes256gcm_NPUBBYTES];
+    randombytes_buf(nonce, nonce_len);
+
+    size_t ciphertext_len = output_len + crypto_aead_aes256gcm_ABYTES;
+    unsigned char *ciphertext = malloc(ciphertext_len);
+    if (!ciphertext) {
+        printf("Failed to allocate ciphertext buffer\n");
+        return;
+    }
+
+    unsigned long long clen;
+    if (crypto_aead_aes256gcm_encrypt(ciphertext, &clen,
+                                      (const unsigned char*)test_output,
+                                      (unsigned long long)output_len,
+                                      NULL, 0,
+                                      NULL,
+                                      nonce, key32) != 0) {
+        printf("Output encryption failed\n");
+        free(ciphertext);
+        return;
+    }
+
+    /* Prepare complete encrypted blob [nonce][ciphertext] */
+    size_t total_len = nonce_len + ciphertext_len;
+    unsigned char *encrypted = malloc(total_len);
+    if (!encrypted) {
+        printf("Failed to allocate encrypted buffer\n");
+        free(ciphertext);
+        return;
+    }
+    memcpy(encrypted, nonce, nonce_len);
+    memcpy(encrypted + nonce_len, ciphertext, ciphertext_len);
+    free(ciphertext);
+
+    printf("Encrypted output into %zu bytes (including nonce and tag)\n",
+           total_len);
+
+    /* Simulate chunked transfer */
+    unsigned char *received = NULL;
+    size_t received_len = 0;
+    if (transfer_in_chunks(encrypted, total_len,
+                           &received, &received_len) != 0) {
+        printf("Chunked transfer simulation failed\n");
+        free(encrypted);
+        return;
+    }
+    printf("Transferred %zu encrypted bytes in chunks\n", received_len);
+    free(encrypted);
+
+    /* Extract nonce and decrypt (simulating host decryption) */
+    const unsigned char *recv_nonce = received;
+    const unsigned char *recv_cipher = received + nonce_len;
+    size_t recv_cipher_len = received_len - nonce_len;
+
+    unsigned char *decrypted = malloc(recv_cipher_len);
+    if (!decrypted) {
+        printf("Failed to allocate decryption buffer\n");
+        free(received);
+        return;
+    }
+
+    unsigned long long mlen;
+    if (crypto_aead_aes256gcm_decrypt(decrypted, &mlen,
+                                      NULL,
+                                      recv_cipher, (unsigned long long)recv_cipher_len,
+                                      NULL, 0,
+                                      recv_nonce, key32) != 0) {
+        printf("Output decryption failed\n");
+        free(decrypted);
+        free(received);
+        return;
+    }
+
+    decrypted[mlen] = '\0';
+    printf("\nDecrypted output (%llu bytes):\n%s\n",
+           mlen, (const char *)decrypted);
+
+    if (mlen != output_len ||
+        memcmp(decrypted, test_output, output_len) != 0) {
+        printf("ERROR: Decrypted output does not match original!\n");
+    } else {
+        printf("Success: Decrypted output matches original\n");
+    }
+
+    free(decrypted);
+    free(received);
+}
+
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
@@ -250,6 +357,9 @@ int main(int argc, char *argv[])
     free(encrypted);
     cJSON_Delete(root);
     free(json_str);
+
+    /* Run output encryption/decryption test */
+    test_output_encryption();
 
     return 0;
 }

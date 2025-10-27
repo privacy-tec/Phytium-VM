@@ -507,8 +507,76 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 		}
 	}
 
-	output_size = strlen(output_buffer) + 1;
-	IMSG("Generated output of size: %zu", output_size);
+	size_t plaintext_len = strlen(output_buffer);
+	IMSG("Generated plaintext output of size: %zu", plaintext_len);
+
+	/* Encrypt the output before sending back to host */
+	unsigned char key32[32];
+	const char *ta_priv = TSC_PRIVKEY;
+	size_t ta_priv_len = strlen(ta_priv);
+	crypto_generichash(key32, sizeof(key32),
+			   (const unsigned char*)ta_priv,
+			   (unsigned long long)ta_priv_len,
+			   NULL, 0);
+
+	/* Format: [nonce][encrypted_output+tag] */
+	const size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES;
+	unsigned char nonce[crypto_aead_aes256gcm_NPUBBYTES];
+	randombytes_buf(nonce, nonce_len);
+
+	size_t ciphertext_len = plaintext_len + crypto_aead_aes256gcm_ABYTES;
+	unsigned char *ciphertext = TEE_Malloc(ciphertext_len, 0);
+	if (!ciphertext) {
+		IMSG("Failed to allocate ciphertext buffer");
+		if (result.release) result.release(&result);
+		TEE_Free(msg);
+		TEE_Free(host);
+		TEE_Free(input);
+		TEE_Free(code);
+		TEE_Free(vm);
+		return TEE_ERROR_OUT_OF_MEMORY;
+	}
+
+	unsigned long long clen;
+	if (crypto_aead_aes256gcm_encrypt(ciphertext, &clen,
+					 (const unsigned char*)output_buffer,
+					 (unsigned long long)plaintext_len,
+					 NULL, 0,
+					 NULL,
+					 nonce, key32) != 0) {
+		IMSG("Output encryption failed");
+		TEE_Free(ciphertext);
+		if (result.release) result.release(&result);
+		TEE_Free(msg);
+		TEE_Free(host);
+		TEE_Free(input);
+		TEE_Free(code);
+		TEE_Free(vm);
+		return TEE_ERROR_GENERIC;
+	}
+
+	/* Replace output_buffer with [nonce][ciphertext] */
+	TEE_Free(output_buffer);
+	output_size = nonce_len + ciphertext_len;
+	output_buffer = TEE_Malloc(output_size, 0);
+	if (!output_buffer) {
+		IMSG("Failed to allocate encrypted output buffer");
+		TEE_Free(ciphertext);
+		if (result.release) result.release(&result);
+		TEE_Free(msg);
+		TEE_Free(host);
+		TEE_Free(input);
+		TEE_Free(code);
+		TEE_Free(vm);
+		return TEE_ERROR_OUT_OF_MEMORY;
+	}
+
+	memcpy(output_buffer, nonce, nonce_len);
+	memcpy(output_buffer + nonce_len, ciphertext, ciphertext_len);
+	TEE_Free(ciphertext);
+
+	IMSG("Output encrypted: original_size=%zu, encrypted_size=%zu",
+	     plaintext_len, output_size);
 
 	// 清理资源
 	if (result.release) result.release(&result);

@@ -181,14 +181,14 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                 return TEEC_SUCCESS;
         }
 
-        // 分配输出缓冲区
-        *output_data = malloc(total_size);
-        if (!*output_data) {
-                printf("Failed to allocate output buffer\n");
+        // 分配接收缓冲区（用于接收加密数据）
+        unsigned char *encrypted_data = malloc(total_size);
+        if (!encrypted_data) {
+                printf("Failed to allocate encrypted buffer\n");
                 return TEEC_ERROR_OUT_OF_MEMORY;
         }
 
-        // 分段接收输出数据
+        // 分段接收加密的输出数据
         while (offset < total_size) {
                 size_t chunk_size = (total_size - offset > MAX_CHUNK_SIZE) ? 
                                    MAX_CHUNK_SIZE : (total_size - offset);
@@ -198,31 +198,82 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                                                  TEEC_MEMREF_TEMP_OUTPUT,
                                                  TEEC_VALUE_INPUT,
                                                  TEEC_VALUE_INPUT);
-                op.params[0].value.a = total_size; // 输出大小
+                op.params[0].value.a = total_size;
                 op.params[1].tmpref.buffer = chunk_buffer;
                 op.params[1].tmpref.size = chunk_size;
-                op.params[2].value.a = 1; // 请求类型：获取块
-                op.params[3].value.a = offset; // 偏移量
+                op.params[2].value.a = 1;
+                op.params[3].value.a = offset;
 
                 res = TEEC_InvokeCommand(sess, TA_TSC_VEE_CMD_GET_OUTPUT, &op, &err_origin);
                 if (res != TEEC_SUCCESS) {
                         printf("Failed to get output chunk at offset %zu: 0x%x\n", offset, res);
-                        free(*output_data);
-                        *output_data = NULL;
+                        free(encrypted_data);
                         return res;
                 }
 
                 size_t actual_chunk_size = op.params[1].tmpref.size;
-                memcpy(*output_data + offset, chunk_buffer, actual_chunk_size);
+                memcpy(encrypted_data + offset, chunk_buffer, actual_chunk_size);
                 offset += actual_chunk_size;
 
-                printf("Received output chunk: offset=%zu, size=%zu\n", 
+                printf("Received encrypted output chunk: offset=%zu, size=%zu\n", 
                        offset - actual_chunk_size, actual_chunk_size);
 
                 if (actual_chunk_size < chunk_size) {
-                        break; // 已经接收完所有数据
+                        break;
                 }
         }
+
+        // 从完整的加密数据中解密输出
+        const size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES;
+        if (total_size <= nonce_len) {
+                printf("Received data too short for decryption\n");
+                free(encrypted_data);
+                return TEEC_ERROR_BAD_FORMAT;
+        }
+
+        // 从输出中提取nonce和密文
+        const unsigned char *nonce = encrypted_data;
+        const unsigned char *ciphertext = encrypted_data + nonce_len;
+        const size_t ciphertext_len = total_size - nonce_len;
+
+        // 从私钥派生32字节密钥 (与加密时使用相同的派生方法)
+        unsigned char key32[32];
+        const char *privkey = get_privkey(NULL);
+        size_t privkey_len = strlen(privkey);
+        crypto_generichash(key32, sizeof(key32),
+                           (const unsigned char*)privkey,
+                           (unsigned long long)privkey_len,
+                           NULL, 0);
+
+        // 分配解密后的输出缓冲区（明文总是小于密文）
+        *output_data = malloc(ciphertext_len);
+        if (!*output_data) {
+                printf("Failed to allocate decryption buffer\n");
+                free(encrypted_data);
+                return TEEC_ERROR_OUT_OF_MEMORY;
+        }
+
+        // 解密输出
+        unsigned long long plaintext_len;
+        if (crypto_aead_aes256gcm_decrypt((unsigned char*)*output_data,
+                                          &plaintext_len,
+                                          NULL,
+                                          ciphertext,
+                                          (unsigned long long)ciphertext_len,
+                                          NULL, 0,
+                                          nonce, key32) != 0) {
+                printf("Output decryption failed\n");
+                free(*output_data);
+                *output_data = NULL;
+                free(encrypted_data);
+                return TEEC_ERROR_GENERIC;
+        }
+
+        // 确保字符串正确终止
+        (*output_data)[plaintext_len] = '\0';
+        printf("Decrypted TA output (%llu bytes)\n", plaintext_len);
+
+        free(encrypted_data);
         return TEEC_SUCCESS;
 }
 
