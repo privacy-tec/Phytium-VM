@@ -45,7 +45,7 @@
 #include <stdint.h>
 #include "tsc_privkey.h"
 #include <sodium.h>
-// 分段传输数据到 TA
+// Chunked transfer of data to the TA
 static TEEC_Result transfer_data_to_ta(TEEC_Session *sess, 
                                       const char *data, 
                                       size_t data_size,
@@ -149,7 +149,7 @@ static const char *get_privkey(size_t *out_len)
         if (out_len) *out_len = strlen(TSC_PRIVKEY);
         return TSC_PRIVKEY;
 }
-// 从 TA 分段接收输出数据
+// Receive output from the TA in chunks
 static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data)
 {
         TEEC_Result res;
@@ -159,13 +159,13 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
         size_t offset = 0;
         char chunk_buffer[MAX_CHUNK_SIZE];
 
-        // 首先获取输出大小
+        // First, request the output size
         memset(&op, 0, sizeof(op));
         op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_OUTPUT,
                                          TEEC_MEMREF_TEMP_OUTPUT,
                                          TEEC_VALUE_INPUT,
                                          TEEC_NONE);
-        op.params[2].value.a = 0; // 请求类型：获取大小
+        op.params[2].value.a = 0; // request type: get size
 
         res = TEEC_InvokeCommand(sess, TA_TSC_VEE_CMD_GET_OUTPUT, &op, &err_origin);
         if (res != TEEC_SUCCESS) {
@@ -181,14 +181,14 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                 return TEEC_SUCCESS;
         }
 
-        // 分配接收缓冲区（用于接收加密数据）
+        // Allocate receive buffer (for encrypted data)
         unsigned char *encrypted_data = malloc(total_size);
         if (!encrypted_data) {
                 printf("Failed to allocate encrypted buffer\n");
                 return TEEC_ERROR_OUT_OF_MEMORY;
         }
 
-        // 分段接收加密的输出数据
+        // Receive encrypted output data in chunks
         while (offset < total_size) {
                 size_t chunk_size = (total_size - offset > MAX_CHUNK_SIZE) ? 
                                    MAX_CHUNK_SIZE : (total_size - offset);
@@ -215,15 +215,15 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                 memcpy(encrypted_data + offset, chunk_buffer, actual_chunk_size);
                 offset += actual_chunk_size;
 
-                printf("Received encrypted output chunk: offset=%zu, size=%zu\n", 
-                       offset - actual_chunk_size, actual_chunk_size);
+                  printf("Received encrypted output chunk: offset=%zu, size=%zu\n",
+                          offset - actual_chunk_size, actual_chunk_size);
 
                 if (actual_chunk_size < chunk_size) {
                         break;
                 }
         }
 
-        // 从完整的加密数据中解密输出
+        // Decrypt output from the complete encrypted blob
         const size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES;
         if (total_size <= nonce_len) {
                 printf("Received data too short for decryption\n");
@@ -231,12 +231,12 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                 return TEEC_ERROR_BAD_FORMAT;
         }
 
-        // 从输出中提取nonce和密文
+        // Extract nonce and ciphertext from the received blob
         const unsigned char *nonce = encrypted_data;
         const unsigned char *ciphertext = encrypted_data + nonce_len;
         const size_t ciphertext_len = total_size - nonce_len;
 
-        // 从私钥派生32字节密钥 (与加密时使用相同的派生方法)
+        // Derive 32-byte key from private key (same derivation as used for encryption)
         unsigned char key32[32];
         const char *privkey = get_privkey(NULL);
         size_t privkey_len = strlen(privkey);
@@ -245,7 +245,7 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                            (unsigned long long)privkey_len,
                            NULL, 0);
 
-        // 分配解密后的输出缓冲区（明文总是小于密文）
+        // Allocate buffer for decrypted output (plaintext <= ciphertext length)
         *output_data = malloc(ciphertext_len);
         if (!*output_data) {
                 printf("Failed to allocate decryption buffer\n");
@@ -253,7 +253,7 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                 return TEEC_ERROR_OUT_OF_MEMORY;
         }
 
-        // 解密输出
+        // Decrypt the output
         unsigned long long plaintext_len;
         if (crypto_aead_aes256gcm_decrypt((unsigned char*)*output_data,
                                           &plaintext_len,
@@ -269,7 +269,7 @@ static TEEC_Result receive_output_from_ta(TEEC_Session *sess, char **output_data
                 return TEEC_ERROR_GENERIC;
         }
 
-        // 确保字符串正确终止
+        // Ensure the string is properly null-terminated
         (*output_data)[plaintext_len] = '\0';
         printf("Decrypted TA output (%llu bytes)\n", plaintext_len);
 
@@ -286,7 +286,7 @@ int main(int argc, char *argv[])
         TEEC_UUID uuid = TA_TSC_VEE_UUID;
         uint32_t err_origin;
 
-        // 检查命令行参数
+        // Check command-line arguments
         if (argc != 2) {
                 printf("Usage: %s <json_file_path>\n", argv[0]);
                 printf("Example: %s args/transferFrom.json\n", argv[0]);
@@ -295,7 +295,7 @@ int main(int argc, char *argv[])
 
         const char *json_file_path = argv[1];
 
-        // Read file and get input data - 严格按照原始 ree 项目的格式
+        // Read file and get input data - follow the original REE project's format
         FILE *fp = NULL;
         fp = fopen(json_file_path, "r");
         if (fp == NULL) {
@@ -317,7 +317,7 @@ int main(int argc, char *argv[])
         p[flen] = 0;
         fclose(fp);
 
-        // Parse json data - 严格按照原始 ree 项目的格式
+        // Parse JSON data - follow the original REE project's format
         cJSON *cjson_content = NULL;
         cJSON *cjson_bytecode = NULL;
         cJSON *cjson_input = NULL;
@@ -337,7 +337,7 @@ int main(int argc, char *argv[])
                 printf("Input: %s\n", cjson_input->valuestring);
                 printf("Gas: %d\n", cjson_gas->valueint);
 
-                /*
+         /*
          * Encrypt bytecode with libsodium AES-256-GCM.
          * Host derives a 32-byte key from the passphrase and encrypts the
          * entire bytecode string. The TA must have the same passphrase/key
@@ -371,7 +371,6 @@ int main(int argc, char *argv[])
         }
 
         /* We'll send encrypted_buf of length encrypted_len */
-*** End Patch
         /* Initialize a context connecting us to the TEE */
         res = TEEC_InitializeContext(NULL, &ctx);
         if (res != TEEC_SUCCESS)

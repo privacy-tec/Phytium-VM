@@ -35,13 +35,13 @@
 
 #include <tsc_vee_ta.h>
 
-// 包含EVM相关头文件
+// Include EVM-related headers
 #include "vm.h"
 #include "instructions_traits.h"
 #include "hex_helpers.h"
 #include "mocked_host.h"
 
-// 全局数据存储
+// Global data storage
 static char *bytecode_buffer = NULL;
 static size_t bytecode_size = 0;
 static char *input_buffer = NULL;
@@ -73,7 +73,7 @@ void TA_DestroyEntryPoint(void)
 {
 	DMSG("TSC-VEE TA destroyed");
 
-	// 清理内存
+	// Cleanup memory
 	if (bytecode_buffer) {
 		TEE_Free(bytecode_buffer);
 		bytecode_buffer = NULL;
@@ -145,7 +145,7 @@ static TEE_Result init_transfer(uint32_t param_types, TEE_Param params[4])
 	if (param_types != exp_param_types)
 		return TEE_ERROR_BAD_PARAMETERS;
 
-	// 清理之前的数据
+	// Clear previous data
 	if (bytecode_buffer) {
 		TEE_Free(bytecode_buffer);
 		bytecode_buffer = NULL;
@@ -159,12 +159,12 @@ static TEE_Result init_transfer(uint32_t param_types, TEE_Param params[4])
 		output_buffer = NULL;
 	}
 
-	// 获取大小信息
+	// Get size information
 	bytecode_size = params[0].value.a;
 	input_size = params[1].value.a;
 	gas_limit = params[2].value.a;
 
-	// 分配内存
+	// Allocate memory
 	bytecode_buffer = TEE_Malloc(bytecode_size, 0);
 	input_buffer = TEE_Malloc(input_size, 0);
 
@@ -192,13 +192,13 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 					   TEE_PARAM_TYPE_VALUE_INPUT,
 					   TEE_PARAM_TYPE_VALUE_INPUT,
 					   TEE_PARAM_TYPE_NONE)) {
-		// 初始化调用
+		// Initialization call
 		data_type = 0;
 	} else if (param_types == TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
 						  TEE_PARAM_TYPE_VALUE_INPUT,
 						  TEE_PARAM_TYPE_VALUE_INPUT,
 						  TEE_PARAM_TYPE_NONE)) {
-		// 数据传输调用
+		// Data transfer call
 		data_type = params[2].value.a;
 		offset = params[1].value.a;
 		chunk_size = params[0].memref.size;
@@ -208,7 +208,7 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 	}
 
 	if (data_type == 0) {
-		// 初始化传输
+	// Initialize transfer
 		if (bytecode_buffer) {
 			TEE_Free(bytecode_buffer);
 			bytecode_buffer = NULL;
@@ -222,12 +222,12 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 			output_buffer = NULL;
 		}
 
-		// 获取大小信息
+	// Get size information
 		bytecode_size = params[0].value.a;
 		input_size = params[1].value.a;
 		gas_limit = params[2].value.a;
 
-		// 分配内存
+	// Allocate memory
 		bytecode_buffer = TEE_Malloc(bytecode_size, 0);
 		input_buffer = TEE_Malloc(input_size, 0);
 
@@ -239,7 +239,7 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 		IMSG("Initialized transfer: bytecode_size=%zu, input_size=%zu, gas=%u",
 		     bytecode_size, input_size, gas_limit);
 	} else if (data_type == 1) {
-		// 传输bytecode（接收为加密数据）
+		// Transfer bytecode (received as encrypted data)
 		if (!bytecode_buffer) {
 			return TEE_ERROR_BAD_STATE;
 		}
@@ -252,7 +252,7 @@ static TEE_Result transfer_data(uint32_t param_types, TEE_Param params[4])
 		memcpy(bytecode_buffer + offset, chunk_data, chunk_size);
 		IMSG("Received encrypted bytecode chunk: offset=%zu, size=%zu", offset, chunk_size);
 	} else if (data_type == 2) {
-		// 传输input
+		// Transfer input
 		if (!input_buffer) {
 			return TEE_ERROR_BAD_STATE;
 		}
@@ -285,18 +285,18 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 		return TEE_ERROR_BAD_STATE;
 	}
 
-	// 验证接收到的数据
+	// Validate received data
 	IMSG("Executing with received data:");
 	IMSG("-Bytecode size: %zu", bytecode_size);
 	IMSG("-Input size: %zu", input_size);
 	IMSG("-Gas limit: %u", gas_limit);
 
-	// 严格按照REE项目的执行逻辑
-	// 1. 初始化指令表
+	// Follow the REE project's execution logic strictly
+	// 1. Initialize instruction tables
 	GasCostTable_init(gas_costs);
 	TraitsTable_init(traits);
 
-	// 2. 创建VM实例
+	// 2. Create VM instance
 	struct evmc_vm *vm = (struct evmc_vm *)TEE_Malloc(sizeof(struct evmc_vm), 0);
 	if (!vm) {
 		IMSG("ERROR: Failed to allocate VM");
@@ -304,10 +304,11 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	}
 	vm_init(vm);
 
-	// 3. 设置EVM版本
+	// 3. Set EVM revision
 	enum evmc_revision rev = EVMC_LONDON;
 
-	// 4. 如果接收到的是加密的 bytecode（格式：[nonce][ciphertext+tag]），先解密，然后转换十六进制字符串为字节数组 - 严格按照REE的逻辑
+	// 4. If the received bytecode is encrypted (format: [nonce][ciphertext+tag]),
+	//    decrypt it first, then convert the hex string to a byte array - follow REE logic
 	if (bytecode_buffer && bytecode_size > 0) {
 		/* Expect at least nonce + tag */
 		size_t nonce_len = crypto_aead_aes256gcm_NPUBBYTES;
@@ -351,7 +352,7 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 		}
 	}
 
-	size_t code_size = bytecode_size / 2 - 1;  // 去掉0x前缀
+	size_t code_size = bytecode_size / 2 - 1;  // remove 0x prefix
 	byte *code = (byte *)TEE_Malloc(sizeof(byte) * code_size, 0);
 	if (!code) {
 		TEE_Free(vm);
@@ -360,7 +361,7 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	}
 	from_hex(bytecode_buffer, code);
 
-	size_t input_hex_size = input_size / 2 - 1;  // 去掉0x前缀
+	size_t input_hex_size = input_size / 2 - 1;  // remove 0x prefix
 	byte *input = (byte *)TEE_Malloc(sizeof(byte) * input_hex_size, 0);
 	if (!input) {
 		TEE_Free(code);
@@ -370,7 +371,7 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	}
 	from_hex(input_buffer, input);
 
-	// 5. 创建模拟主机接口
+	// 5. Create mocked host interface
 	MockedHost* host = (MockedHost*)TEE_Malloc(sizeof(MockedHost), 0);
 	if (!host) {
 		TEE_Free(input);
@@ -381,7 +382,7 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	}
 	MockedHost_init(host);
 
-	// 6. 创建消息
+	// 6. Create message
 	struct evmc_message* msg = (struct evmc_message*)TEE_Malloc(sizeof(struct evmc_message), 0);
 	if (!msg) {
 		TEE_Free(host);
@@ -393,23 +394,23 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	}
 	EVMCMessage_init_v(msg, gas_limit, input, input_hex_size);
 
-	// 7. 执行EVM代码
+	// 7. Execute EVM code
 	DMSG("Executing EVM code...");
 	struct evmc_result result = vm->execute(vm, host, rev, msg, code, code_size);
 
-	// 8. 处理执行结果 - 严格按照REE的输出格式
+	// 8. Handle execution result - follow REE output format
 	int64_t gas_used = msg->gas - result.gas_left;
 	DMSG("Execution completed:");
 	DMSG("-Status code: %d", result.status_code);
 	DMSG("-Gas used: %ld", gas_used);
 	DMSG("-Output size: %zu", result.output_size);
 
-	// 9. 生成输出报告 - 严格与REE保持一致
+	// 9. Generate output report - match REE format
 	if (output_buffer) {
 		TEE_Free(output_buffer);
 	}
 
-	// 分配足够大的输出缓冲区
+	// Allocate a sufficiently large output buffer
 	output_size = 8192;
 	output_buffer = TEE_Malloc(output_size, 0);
 	if (!output_buffer) {
@@ -423,14 +424,14 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 		return TEE_ERROR_OUT_OF_MEMORY;
 	}
 
-	// 严格按照REE的输出格式构建字符串
+	// Construct the output string strictly following REE format
 	size_t pos = 0;
 
 	// "\nResult: <status_code>\n"
 	strcpy(output_buffer, "\nResult: ");
 	pos = strlen(output_buffer);
 
-	// 转换status_code到字符串
+	// Convert status_code to string
 	char status_str[16];
 	int status = result.status_code;
 	int status_pos = 0;
@@ -458,7 +459,7 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	strcpy(output_buffer + pos, "Gas used: ");
 	pos = strlen(output_buffer);
 
-	// 转换gas_used到字符串
+	// Convert gas_used to string
 	char gas_str[32];
 	int gas_pos = 0;
 	long gas = gas_used;
@@ -482,10 +483,10 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	strcpy(output_buffer + pos, "\n");
 	pos = strlen(output_buffer);
 
-	// "Output: <hex_output>\n" (如果成功或revert) - 严格按照REE的格式
+	// "Output: <hex_output>\n" (if success or revert) - follow REE format
 	if (result.status_code == EVMC_SUCCESS || result.status_code == EVMC_REVERT) {
 		if (result.output_size > 0) {
-			// 按照REE的格式：outlen = result.output_size * 2 + 2
+			    // According to REE format: outlen = result.output_size * 2 + 2
 			size_t outlen = result.output_size * 2 + 2;
 			char *output_hex = (char *)TEE_Malloc(sizeof(char) * outlen, 0);
 			if (output_hex) {
@@ -510,7 +511,7 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	size_t plaintext_len = strlen(output_buffer);
 	IMSG("Generated plaintext output of size: %zu", plaintext_len);
 
-	/* Encrypt the output before sending back to host */
+	/* Encrypt the output before sending it back to the host */
 	unsigned char key32[32];
 	const char *ta_priv = TSC_PRIVKEY;
 	size_t ta_priv_len = strlen(ta_priv);
@@ -575,10 +576,10 @@ static TEE_Result execute_with_data(uint32_t param_types, TEE_Param params[4])
 	memcpy(output_buffer + nonce_len, ciphertext, ciphertext_len);
 	TEE_Free(ciphertext);
 
-	IMSG("Output encrypted: original_size=%zu, encrypted_size=%zu",
-	     plaintext_len, output_size);
+    IMSG("Output encrypted: original_size=%zu, encrypted_size=%zu",
+	    plaintext_len, output_size);
 
-	// 清理资源
+    // Cleanup resources
 	if (result.release) result.release(&result);
 	TEE_Free(msg);
 	TEE_Free(host);
@@ -602,18 +603,18 @@ static TEE_Result get_output(uint32_t param_types, TEE_Param params[4])
 	size_t chunk_size = 0;
 	char *chunk_buffer = NULL;
 
-	// 检查参数类型 - 支持两种调用方式
+	// Check parameter types - support two call modes
 	if (param_types == TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT,
 					   TEE_PARAM_TYPE_MEMREF_OUTPUT,
 					   TEE_PARAM_TYPE_VALUE_INPUT,
 					   TEE_PARAM_TYPE_NONE)) {
-		// 获取输出大小
+	// Get output size
 		request_type = params[2].value.a;
 	} else if (param_types == TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT,
 						  TEE_PARAM_TYPE_MEMREF_OUTPUT,
 						  TEE_PARAM_TYPE_VALUE_INPUT,
 						  TEE_PARAM_TYPE_VALUE_INPUT)) {
-		// 获取输出块
+	// Get output chunk
 		request_type = params[2].value.a;
 		offset = params[3].value.a;
 		chunk_size = params[1].memref.size;
@@ -637,7 +638,7 @@ static TEE_Result get_output(uint32_t param_types, TEE_Param params[4])
 
 		memcpy(chunk_buffer, output_buffer + offset, actual_chunk_size);
 		params[1].memref.size = actual_chunk_size;
-		// 保持params[0].value.a不变，让host端知道总大小
+	// Leave params[0].value.a unchanged so the host knows the total size
 
 		IMSG("Sent output chunk: offset=%zu, size=%zu", offset, actual_chunk_size);
 	} else {
